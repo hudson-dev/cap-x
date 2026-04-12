@@ -1,0 +1,4 @@
+conda activate mujuco
+cd /mnt/spare-ssd/hudsonssd/development/cap-x
+python simulation/run.py          # MuJoCo viewer
+python simulation/run.py --splat  # With Gaussian splat rendering

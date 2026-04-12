@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Eyeball Quest Teleop</title>
+<style>
+  body { margin: 0; background: #000; color: #0f0; font-family: monospace; overflow: hidden; }
+  #overlay {
+    position: absolute; top: 10px; left: 10px; z-index: 10;
+    background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px;
+    font-size: 14px; pointer-events: none;
+  }
+  #start-btn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 24px; padding: 20px 40px; background: #333; color: #0f0;
+    border: 2px solid #0f0; border-radius: 10px; cursor: pointer;
+    font-family: monospace; z-index: 20;
+  }
+  #start-btn:hover { background: #0f0; color: #000; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div id="status">Disconnected</div>
+  <div id="fps">FPS: --</div>
+  <div id="latency">Latency: --</div>
+  <div id="mode">Mode: relative</div>
+</div>
+
+<button id="start-btn">Enter VR</button>
+
+<script>
+// ─── Configuration ───────────────────────────────────────────────
+const WS_URL = `ws://${location.host}/ws`;
+const SEND_RATE_MS = 14; // ~72Hz controller data send rate
+
+// ─── State ───────────────────────────────────────────────────────
+let ws = null;
+let xrSession = null;
+let xrRefSpace = null;
+let gl = null;
+let glTexture = null;
+let frameCount = 0;
+let lastFpsTime = 0;
+let controlMode = 'relative';
+let sendInterval = null;
+let latestFrame = null;  // Store latest received frame for rendering
+let latestRenderQuat = [0, 0, 0, 1];  // xyzw render-time head quat from server
+let smoothedCorrectionMat3 = new Float32Array([1,0,0, 0,1,0, 0,0,1]);  // identity
+let renderProj = 0;  // render camera projection param (from server JSON config)
+let ipdSent = false;  // Only send IPD once per session
+let useH264 = false;  // Set from server JSON config
+let videoDecoder = null;  // WebCodecs VideoDecoder
+let h264FrameIndex = 0;  // Monotonic timestamp counter for VideoDecoder
+
+// Controller state (updated each XR frame)
+let headPos = new Float32Array(3);
+let headQuat = new Float32Array(4);
+let leftPos = new Float32Array(3);
+let leftQuat = new Float32Array(4);
+let rightPos = new Float32Array(3);
+let rightQuat = new Float32Array(4);
+let leftTrigger = 0, rightTrigger = 0;
+let leftGrip = 0, rightGrip = 0;
+let buttonMask = 0;
+let flashAlpha = 0.0;
+let flashStartTime = 0;
+
+// Binary message buffer (104 bytes)
+const sendBuffer = new ArrayBuffer(104);
+const sendView = new DataView(sendBuffer);
+
+// ─── WebSocket ───────────────────────────────────────────────────
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    document.getElementById('status').textContent = 'Connected';
+    console.log('[WS] Connected');
+    // Reset H.264 decoder on reconnect to avoid stale state
+    if (videoDecoder) { videoDecoder.close(); videoDecoder = null; }
+    useH264 = false;
+    h264FrameIndex = 0;
+  };
+
+  ws.onmessage = (evt) => {
+    if (evt.data instanceof ArrayBuffer) {
+      const buf = evt.data;
+      if (buf.byteLength > 16) {
+        const dv = new DataView(buf, 0, 16);
+        latestRenderQuat = [
+          dv.getFloat32(0, true), dv.getFloat32(4, true),
+          dv.getFloat32(8, true), dv.getFloat32(12, true),
+        ];
+        latestFrame = buf.slice(16);
+      } else {
+        latestFrame = buf;
+      }
+      frameCount++;
+    } else {
+      // JSON = status/mode update
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.mode) {
+          controlMode = msg.mode;
+          document.getElementById('mode').textContent = `Mode: ${msg.mode}`;
+        }
+        if (msg.status) {
+          document.getElementById('status').textContent = msg.status;
+        }
+        if (msg.flash) {
+          flashAlpha = 0.3;
+          flashStartTime = performance.now();
+          console.log('[Flash] Triggered, flashAlpha=' + flashAlpha);
+        }
+        if (msg.renderProj) {
+          renderProj = msg.renderProj;
+          console.log(`[Config] Render projection: ${renderProj.toFixed(4)}`);
+        }
+        if (msg.codec === 'h264') {
+          useH264 = true;
+          console.log('[Config] Using H.264 codec with WebCodecs VideoDecoder');
+        }
+      } catch (e) { console.warn('[WS] Bad JSON:', evt.data); }
+    }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('status').textContent = 'Disconnected';
+    console.log('[WS] Disconnected, reconnecting in 2s...');
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = (err) => {
+    console.error('[WS] Error:', err);
+    ws.close();
+  };
+}
+
+// ─── Send controller data (binary, 104 bytes) ───────────────────
+function sendControllerData() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  let off = 0;
+  // Head position (3 x f32)
+  for (let i = 0; i < 3; i++) { sendView.setFloat32(off, headPos[i], true); off += 4; }
+  // Head quaternion xyzw (4 x f32)
+  for (let i = 0; i < 4; i++) { sendView.setFloat32(off, headQuat[i], true); off += 4; }
+  // Left controller position (3 x f32)
+  for (let i = 0; i < 3; i++) { sendView.setFloat32(off, leftPos[i], true); off += 4; }
+  // Left controller quaternion xyzw (4 x f32)
+  for (let i = 0; i < 4; i++) { sendView.setFloat32(off, leftQuat[i], true); off += 4; }
+  // Right controller position (3 x f32)
+  for (let i = 0; i < 3; i++) { sendView.setFloat32(off, rightPos[i], true); off += 4; }
+  // Right controller quaternion xyzw (4 x f32)
+  for (let i = 0; i < 4; i++) { sendView.setFloat32(off, rightQuat[i], true); off += 4; }
+  // Triggers + grips (4 x f32)
+  sendView.setFloat32(off, leftTrigger, true); off += 4;
+  sendView.setFloat32(off, rightTrigger, true); off += 4;
+  sendView.setFloat32(off, leftGrip, true); off += 4;
+  sendView.setFloat32(off, rightGrip, true); off += 4;
+  // Button bitmask (uint32)
+  sendView.setUint32(off, buttonMask, true); off += 4;
+
+  ws.send(sendBuffer);
+}
+
+// ─── Quaternion Helpers (xyzw convention) ─────────────────────────
+function quatConj(q) { return [-q[0], -q[1], -q[2], q[3]]; }
+
+function quatMul(a, b) {
+  return [
+    a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+    a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+    a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+    a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2],
+  ];
+}
+
+function quatSlerp(a, b, t) {
+  // Ensure shortest path
+  let dot = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+  if (dot < 0) { b = [-b[0], -b[1], -b[2], -b[3]]; dot = -dot; }
+  if (dot > 0.9995) {
+    // Linear interpolation for very close quats
+    const out = [a[0] + t*(b[0]-a[0]), a[1] + t*(b[1]-a[1]), a[2] + t*(b[2]-a[2]), a[3] + t*(b[3]-a[3])];
+    const inv = 1.0 / Math.sqrt(out[0]*out[0] + out[1]*out[1] + out[2]*out[2] + out[3]*out[3]);
+    return [out[0]*inv, out[1]*inv, out[2]*inv, out[3]*inv];
+  }
+  const theta = Math.acos(dot);
+  const sinTheta = Math.sin(theta);
+  const wa = Math.sin((1-t)*theta) / sinTheta;
+  const wb = Math.sin(t*theta) / sinTheta;
+  return [wa*a[0]+wb*b[0], wa*a[1]+wb*b[1], wa*a[2]+wb*b[2], wa*a[3]+wb*b[3]];
+}
+
+function quatToMat3(q) {
+  const [x, y, z, w] = q;
+  const x2 = x+x, y2 = y+y, z2 = z+z;
+  const xx = x*x2, xy = x*y2, xz = x*z2;
+  const yy = y*y2, yz = y*z2, zz = z*z2;
+  const wx = w*x2, wy = w*y2, wz = w*z2;
+  // Column-major 3x3
+  return new Float32Array([
+    1-yy-zz,  xy+wz,    xz-wy,
+    xy-wz,    1-xx-zz,  yz+wx,
+    xz+wy,    yz-wx,    1-xx-yy,
+  ]);
+}
+
+// ─── WebXR Setup ─────────────────────────────────────────────────
+async function startXR() {
+  if (!navigator.xr) {
+    alert('WebXR not supported in this browser');
+    return;
+  }
+
+  const supported = await navigator.xr.isSessionSupported('immersive-vr');
+  if (!supported) {
+    alert('Immersive VR not supported');
+    return;
+  }
+
+  // Create canvas + GL context
+  const canvas = document.createElement('canvas');
+  document.body.appendChild(canvas);
+  gl = canvas.getContext('webgl2', { xrCompatible: true });
+  if (!gl) {
+    alert('WebGL2 not available');
+    return;
+  }
+
+  // Create texture for video frames
+  glTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, glTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // No UNPACK_FLIP_Y — createImageBitmap on Quest already gives correct orientation.
+  // UV mapping handles the OpenGL row-order (row 0 = bottom of texture = top of image).
+  // Upload a 1x1 black pixel as placeholder
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+    new Uint8Array([0, 0, 0, 255]));
+
+  // Compile shaders for textured quad.
+  // Quad is positioned in VIEW SPACE at a fixed depth, sized to exactly fill
+  // the eye's frustum. The projection matrix then maps it to fill the viewport.
+  // This ensures the headset's compositor/timewarp has correct pose info per eye,
+  // preventing the double-vision that happens with raw clip-space quads.
+  const vsSource = `#version 300 es
+    in vec2 aCorner;
+    in vec2 aUV;
+    uniform mat4 uProj;
+    out vec2 vUV;
+    out vec2 vCorner;
+    void main() {
+      float depth = 0.5;
+      float x = aCorner.x * depth / uProj[0][0];
+      float y = aCorner.y * depth / uProj[1][1];
+      gl_Position = uProj * vec4(x, y, -depth, 1.0);
+      vUV = aUV;
+      vCorner = aCorner;
+    }`;
+
+  const fsSource = `#version 300 es
+    precision highp float;
+    in vec2 vUV;
+    in vec2 vCorner;
+    out vec4 fragColor;
+    uniform sampler2D uTex;
+    uniform mat3 uCorrectionRot;
+    uniform vec2 uProjParams;
+    uniform float uUVBase;
+    uniform float uRenderProj;
+    uniform float uFlashAlpha;
+    void main() {
+      // 1. Current pixel's view direction (using DISPLAY projection)
+      vec3 dir = vec3(vCorner.x / uProjParams.x, vCorner.y / uProjParams.y, -1.0);
+      // 2. Rotate to render-time view space
+      vec3 corrDir = uCorrectionRot * dir;
+      // 3. Behind camera check
+      if (corrDir.z >= 0.0) { fragColor = vec4(0.0); return; }
+      // 4. Reproject using RENDER projection (maps to texture UV space)
+      float rp = uRenderProj > 0.0 ? uRenderProj : uProjParams.x;
+      vec2 corrCorner = vec2(
+        corrDir.x * rp / (-corrDir.z),
+        corrDir.y * rp / (-corrDir.z)
+      );
+      // 5. Screen coords to UV (same mapping as quad data)
+      vec2 corrUV = vec2(
+        uUVBase + (corrCorner.x + 1.0) * 0.25,
+        (1.0 - corrCorner.y) * 0.5
+      );
+      // 6. Clamp to this eye's UV range
+      corrUV = clamp(corrUV, vec2(uUVBase, 0.0), vec2(uUVBase + 0.5, 1.0));
+      vec4 col = texture(uTex, corrUV);
+      // 7. Red flash overlay
+      fragColor = mix(col, vec4(1.0, 0.0, 0.0, 1.0), uFlashAlpha);
+    }`;
+
+  function compileShader(src, type) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error('Shader error:', gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  }
+
+  const vs = compileShader(vsSource, gl.VERTEX_SHADER);
+  const fs = compileShader(fsSource, gl.FRAGMENT_SHADER);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+
+  const aCornerLoc = gl.getAttribLocation(prog, 'aCorner');
+  const aUVLoc = gl.getAttribLocation(prog, 'aUV');
+  const uTexLoc = gl.getUniformLocation(prog, 'uTex');
+  const uProjLoc = gl.getUniformLocation(prog, 'uProj');
+  const uCorrectionRotLoc = gl.getUniformLocation(prog, 'uCorrectionRot');
+  const uProjParamsLoc = gl.getUniformLocation(prog, 'uProjParams');
+  const uUVBaseLoc = gl.getUniformLocation(prog, 'uUVBase');
+  const uRenderProjLoc = gl.getUniformLocation(prog, 'uRenderProj');
+  const uFlashAlphaLoc = gl.getUniformLocation(prog, 'uFlashAlpha');
+
+  // Quad corner positions (NDC-like, -1 to +1) + UV coordinates.
+  // Without UNPACK_FLIP_Y: texture row 0 = bottom, so image top is at V=0.
+  // Screen top (corner.y = +1) should show image top → V=0.
+  // Screen bottom (corner.y = -1) should show image bottom → V=1.
+  // Left eye: U = 0.0 - 0.5 (left half of stereo image)
+  const leftQuadData = new Float32Array([
+    // corner (x,y), uv (u,v)
+    -1, -1,  0.0, 1.0,
+     1, -1,  0.5, 1.0,
+     1,  1,  0.5, 0.0,
+    -1,  1,  0.0, 0.0,
+  ]);
+  // Right eye: U = 0.5 - 1.0 (right half of stereo image)
+  const rightQuadData = new Float32Array([
+    -1, -1,  0.5, 1.0,
+     1, -1,  1.0, 1.0,
+     1,  1,  1.0, 0.0,
+    -1,  1,  0.5, 0.0,
+  ]);
+
+  const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+  function makeVAO(quadData) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, quadData, gl.STATIC_DRAW);
+
+    const ebo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(aCornerLoc);
+    gl.vertexAttribPointer(aCornerLoc, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(aUVLoc);
+    gl.vertexAttribPointer(aUVLoc, 2, gl.FLOAT, false, 16, 8);
+
+    gl.bindVertexArray(null);
+    return vao;
+  }
+
+  const leftVAO = makeVAO(leftQuadData);
+  const rightVAO = makeVAO(rightQuadData);
+
+  // Frame decode state
+  let pendingDecode = false;
+  let pendingDecodeQuat = null;
+  let textureRenderQuat = null;  // null until first frame decoded
+  let _decCount = 0, _decDecode = 0, _decUpload = 0, _decSkipped = 0, _decLast = performance.now();
+
+  function _reportDecStats(t0, t1, t2) {
+    _decCount++;
+    _decDecode += t1 - t0;
+    _decUpload += t2 - t1;
+    if (t2 - _decLast >= 3000 && _decCount > 0) {
+      const n = _decCount;
+      const codec = useH264 ? 'h264' : 'jpeg';
+      console.log(`[Client ${codec}] ${(n/3).toFixed(1)} fps | decode ${(_decDecode/n).toFixed(1)}ms  upload ${(_decUpload/n).toFixed(1)}ms  skipped ${_decSkipped}`);
+      _decCount = _decDecode = _decUpload = _decSkipped = 0;
+      _decLast = t2;
+    }
+  }
+
+  // ── H.264 decode via WebCodecs VideoDecoder ──
+  function extractCodecString(data) {
+    const bytes = new Uint8Array(data);
+    for (let i = 0; i < bytes.length - 5; i++) {
+      if (bytes[i] === 0 && bytes[i+1] === 0 && bytes[i+2] === 0 && bytes[i+3] === 1) {
+        const nalType = bytes[i+4] & 0x1F;
+        if (nalType === 7) {  // SPS
+          const profileIdc = bytes[i+5];
+          const constraintFlags = bytes[i+6];
+          const levelIdc = bytes[i+7];
+          const hex = (v) => v.toString(16).padStart(2, '0');
+          return `avc1.${hex(profileIdc)}${hex(constraintFlags)}${hex(levelIdc)}`;
+        }
+      }
+    }
+    return 'avc1.4d0028';  // fallback: Main profile, level 4.0
+  }
+
+  function initVideoDecoder(firstFrame) {
+    if (videoDecoder) { videoDecoder.close(); videoDecoder = null; }
+
+    const codecStr = extractCodecString(firstFrame);
+    console.log(`[H264] Initializing VideoDecoder: ${codecStr}`);
+
+    videoDecoder = new VideoDecoder({
+      output: (frame) => {
+        const t1 = performance.now();
+        gl.bindTexture(gl.TEXTURE_2D, glTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, frame);
+        frame.close();
+        const t2 = performance.now();
+        textureRenderQuat = pendingDecodeQuat;
+
+        pendingDecode = false;
+        _reportDecStats(_h264DecodeStart, t1, t2);
+      },
+      error: (e) => {
+        console.error('[H264] Decoder error:', e);
+        pendingDecode = false;
+      },
+    });
+
+    videoDecoder.configure({
+      codec: codecStr,
+      optimizeForLatency: true,
+      hardwareAcceleration: 'prefer-hardware',
+    });
+    console.log('[H264] VideoDecoder configured');
+  }
+
+  let _h264DecodeStart = 0;
+
+  function decodeH264Frame(arrayBuf) {
+    if (!videoDecoder) {
+      initVideoDecoder(arrayBuf);
+    }
+    if (videoDecoder.decodeQueueSize > 2) {
+      pendingDecode = false;
+      _decSkipped++;
+      return;
+    }
+    _h264DecodeStart = performance.now();
+    const chunk = new EncodedVideoChunk({
+      type: 'key',
+      timestamp: h264FrameIndex++ * 33333,
+      data: arrayBuf,
+    });
+    try {
+      videoDecoder.decode(chunk);
+    } catch (e) {
+      console.warn('[H264] Decode error:', e);
+      pendingDecode = false;
+    }
+  }
+
+  // ── JPEG decode via createImageBitmap ──
+  function decodeJpegFrame(arrayBuf) {
+    const blob = new Blob([arrayBuf], { type: 'image/jpeg' });
+    const t0 = performance.now();
+    createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }).then((bmp) => {
+      const t1 = performance.now();
+      gl.bindTexture(gl.TEXTURE_2D, glTexture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+      bmp.close();
+      const t2 = performance.now();
+      textureRenderQuat = pendingDecodeQuat;
+      textureRenderPos = pendingDecodePos;
+      pendingDecode = false;
+      _reportDecStats(t0, t1, t2);
+    }).catch((e) => { console.warn('[JPEG] Decode failed:', e); pendingDecode = false; });
+  }
+
+  // ── Dispatch ──
+  function decodeAndUploadFrame(arrayBuf, renderQuat) {
+    if (pendingDecode) { _decSkipped++; return; }
+    pendingDecode = true;
+    pendingDecodeQuat = [renderQuat[0], renderQuat[1], renderQuat[2], renderQuat[3]];
+    if (useH264) {
+      decodeH264Frame(arrayBuf);
+    } else {
+      decodeJpegFrame(arrayBuf);
+    }
+  }
+
+  // Request XR session
+  xrSession = await navigator.xr.requestSession('immersive-vr', {
+    requiredFeatures: ['local-floor'],
+  });
+
+  document.getElementById('start-btn').style.display = 'none';
+
+  // Request native framebuffer resolution — default is often 0.5-0.7x on Quest
+  const nativeScale = XRWebGLLayer.getNativeFramebufferScaleFactor(xrSession);
+  console.log(`[XR] Native framebuffer scale: ${nativeScale.toFixed(2)}`);
+  const xrLayer = new XRWebGLLayer(xrSession, gl, {
+    framebufferScaleFactor: nativeScale,
+  });
+  xrSession.updateRenderState({ baseLayer: xrLayer });
+
+  xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+
+  // Start sending controller data at fixed rate
+  sendInterval = setInterval(sendControllerData, SEND_RATE_MS);
+
+  // FPS counter
+  lastFpsTime = performance.now();
+
+  // XR frame loop
+  xrSession.requestAnimationFrame(function onXRFrame(time, frame) {
+    xrSession.requestAnimationFrame(onXRFrame);
+
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (!pose) return;
+
+    // Update head tracking
+    const headTransform = pose.transform;
+    headPos[0] = headTransform.position.x;
+    headPos[1] = headTransform.position.y;
+    headPos[2] = headTransform.position.z;
+    headQuat[0] = headTransform.orientation.x;
+    headQuat[1] = headTransform.orientation.y;
+    headQuat[2] = headTransform.orientation.z;
+    headQuat[3] = headTransform.orientation.w;
+
+    // Extract and send IPD from per-eye view offsets (once per session)
+    if (!ipdSent && pose.views.length >= 2 && ws && ws.readyState === WebSocket.OPEN) {
+      let leftEye = null, rightEye = null;
+      for (const view of pose.views) {
+        if (view.eye === 'left') leftEye = view.transform.position;
+        else if (view.eye === 'right') rightEye = view.transform.position;
+      }
+      if (leftEye && rightEye) {
+        const dx = leftEye.x - rightEye.x;
+        const dy = leftEye.y - rightEye.y;
+        const dz = leftEye.z - rightEye.z;
+        const ipd = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        ws.send(JSON.stringify({ ipd: ipd }));
+        console.log(`[IPD] Sent headset IPD: ${(ipd * 1000).toFixed(1)} mm`);
+        ipdSent = true;
+      }
+    }
+
+    // Update controller tracking
+    buttonMask = 0;
+    for (const source of xrSession.inputSources) {
+      if (!source.gripSpace) continue;
+      const gripPose = frame.getPose(source.gripSpace, xrRefSpace);
+      if (!gripPose) continue;
+
+      const p = gripPose.transform.position;
+      const q = gripPose.transform.orientation;
+      const gp = source.gamepad;
+
+      if (source.handedness === 'left') {
+        leftPos[0] = p.x; leftPos[1] = p.y; leftPos[2] = p.z;
+        leftQuat[0] = q.x; leftQuat[1] = q.y; leftQuat[2] = q.z; leftQuat[3] = q.w;
+        if (gp) {
+          leftTrigger = gp.buttons[0] ? gp.buttons[0].value : 0;
+          leftGrip = gp.buttons[1] ? gp.buttons[1].value : 0;
+          // X button
+          if (gp.buttons[4] && gp.buttons[4].pressed) buttonMask |= (1 << 2);
+          // Y button
+          if (gp.buttons[5] && gp.buttons[5].pressed) buttonMask |= (1 << 3);
+          // Left thumbstick press
+          if (gp.buttons[3] && gp.buttons[3].pressed) buttonMask |= (1 << 4);
+        }
+      } else if (source.handedness === 'right') {
+        rightPos[0] = p.x; rightPos[1] = p.y; rightPos[2] = p.z;
+        rightQuat[0] = q.x; rightQuat[1] = q.y; rightQuat[2] = q.z; rightQuat[3] = q.w;
+        if (gp) {
+          rightTrigger = gp.buttons[0] ? gp.buttons[0].value : 0;
+          rightGrip = gp.buttons[1] ? gp.buttons[1].value : 0;
+          // A button
+          if (gp.buttons[4] && gp.buttons[4].pressed) buttonMask |= (1 << 0);
+          // B button
+          if (gp.buttons[5] && gp.buttons[5].pressed) buttonMask |= (1 << 1);
+          // Right thumbstick press
+          if (gp.buttons[3] && gp.buttons[3].pressed) buttonMask |= (1 << 5);
+        }
+      }
+    }
+
+    // Decode latest frame if available
+    if (latestFrame) {
+      decodeAndUploadFrame(latestFrame, latestRenderQuat);
+      latestFrame = null;
+    }
+
+    // FPS counter (update every second)
+    if (time - lastFpsTime > 1000) {
+      const fps = Math.round(frameCount * 1000 / (time - lastFpsTime));
+      document.getElementById('fps').textContent = `FPS: ${fps}`;
+      frameCount = 0;
+      lastFpsTime = time;
+    }
+
+    // Compute correction rotation: current-view → render-view
+    // correction = conj(Q_render) * Q_current
+    if (textureRenderQuat) {
+      const currentQuat = [headQuat[0], headQuat[1], headQuat[2], headQuat[3]];
+      const correctionQuat = quatMul(quatConj(textureRenderQuat), currentQuat);
+      smoothedCorrectionMat3 = quatToMat3(correctionQuat);
+    }
+
+    // Render to XR framebuffer
+    const glLayer = xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+
+    gl.useProgram(prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, glTexture);
+    gl.uniform1i(uTexLoc, 0);
+    gl.uniformMatrix3fv(uCorrectionRotLoc, false, smoothedCorrectionMat3);
+    gl.uniform1f(uRenderProjLoc, renderProj);
+
+    // Decay red flash (fade out over 300ms)
+    if (flashAlpha > 0.0) {
+      const elapsed = performance.now() - flashStartTime;
+      flashAlpha = Math.max(0.0, 0.3 * (1.0 - elapsed / 300.0));
+    }
+    gl.uniform1f(uFlashAlphaLoc, flashAlpha);
+
+    // Draw each eye with per-eye projection params and UV base
+    for (const view of pose.views) {
+      const vp = glLayer.getViewport(view);
+      gl.viewport(vp.x, vp.y, vp.width, vp.height);
+
+      gl.uniformMatrix4fv(uProjLoc, false, view.projectionMatrix);
+
+      // Extract projection params for fragment shader UV reprojection
+      const pm = view.projectionMatrix;
+      gl.uniform2f(uProjParamsLoc, pm[0], pm[5]);  // proj[0][0], proj[1][1]
+
+      // UV base: left eye samples U=[0, 0.5], right eye samples U=[0.5, 1.0]
+      gl.uniform1f(uUVBaseLoc, view.eye === 'left' ? 0.0 : 0.5);
+
+      if (view.eye === 'left') {
+        gl.bindVertexArray(leftVAO);
+      } else {
+        gl.bindVertexArray(rightVAO);
+      }
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    }
+  });
+
+  xrSession.addEventListener('end', () => {
+    console.log('[XR] Session ended');
+    if (sendInterval) clearInterval(sendInterval);
+    xrSession = null;
+    document.getElementById('start-btn').style.display = 'block';
+  });
+}
+
+// ─── Non-VR fallback (flat screen preview) ───────────────────────
+function startFlatPreview() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1440;
+  canvas.height = 720;
+  canvas.style.maxWidth = '100vw';
+  canvas.style.maxHeight = '100vh';
+  canvas.style.objectFit = 'contain';
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+
+  function drawFrame() {
+    if (latestFrame) {
+      const blob = new Blob([latestFrame], { type: 'image/jpeg' });
+      createImageBitmap(blob).then((bmp) => {
+        ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+        bmp.close();
+      });
+      latestFrame = null;
+      frameCount++;
+    }
+
+    const now = performance.now();
+    if (now - lastFpsTime > 1000) {
+      const fps = Math.round(frameCount * 1000 / (now - lastFpsTime));
+      document.getElementById('fps').textContent = `FPS: ${fps}`;
+      frameCount = 0;
+      lastFpsTime = now;
+    }
+
+    requestAnimationFrame(drawFrame);
+  }
+  lastFpsTime = performance.now();
+  drawFrame();
+}
+
+// ─── Init ────────────────────────────────────────────────────────
+connectWS();
+
+document.getElementById('start-btn').addEventListener('click', async () => {
+  if (navigator.xr) {
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (supported) {
+      startXR();
+      return;
+    }
+  }
+  // Fallback: flat screen preview
+  document.getElementById('start-btn').style.display = 'none';
+  startFlatPreview();
+});
+
+</script>
+</body>
+</html>
