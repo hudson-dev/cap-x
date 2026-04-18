@@ -20,6 +20,13 @@ TOMATO_SAUCE_XML = _LIBERO / "tomato_sauce" / "tomato_sauce.xml"
 BBQ_SAUCE_XML    = _LIBERO / "bbq_sauce"    / "bbq_sauce.xml"
 CREAM_CHEESE_XML = _LIBERO / "cream_cheese" / "cream_cheese.xml"
 
+_LIBERO_SCANNED = SIM_DIR.parent / "LIBERO-PRO" / "libero" / "libero" / "assets" / "stable_scanned_objects"
+BASKET_XML = _LIBERO_SCANNED / "basket" / "basket.xml"
+
+# Basket position on the table, next to the scanned object grid.
+# Adjust x/y to move it; z=-0.35 puts the basket bottom flush with the table surface (z=-0.41).
+BASKET_POS = [0.875, -0.125, -0.44]
+
 # (xml_path, prefix, [x, y, z], quat or None)
 # z = -0.41 (table surface). Tomato sauce needs 90-deg rotation around X to stand upright.
 OBJECT_PLACEMENTS = [
@@ -28,10 +35,61 @@ OBJECT_PLACEMENTS = [
     (CREAM_CHEESE_XML, "cream_cheese_", [0.2,  0.25, -0.43], None),
 ]
 
+_SCANNED = SIM_DIR.parent / "objects"
+
+# 2x3 grid on the table for scanned objects. Per-object z places the object's
+# bottom on the table surface (z = -0.41), computed from each mesh's bounding box.
+# quat [0.7071, 0.7071, 0, 0] = 90° around X: converts Y-up scan meshes to MuJoCo Z-up world.
+# Per-object z is computed so the object's bottom rests on the table surface (z = -0.41).
+# Global offset applied to all objects and arms: [x, y, 0]
+# +x = further back on table, -y = further right
+SCENE_OFFSET = [-0.75, 0.35, 0.0]
+
+# Object-only offset, applied on top of SCENE_OFFSET: [x, y, 0]
+# +x = further back, -x = further forward, +y = further left, -y = further right
+OBJECT_OFFSET = [0.15, 0.0, 0.0]
+
+# 2x3 grid origin (top-left object position) and spacing
+# GRID_SPACING_X: distance between the 2 rows (back-to-front)
+# GRID_SPACING_Y: distance between the 3 columns (left-right)
+GRID_BASE_X   = 0.628
+GRID_BASE_Y   = 0.023
+GRID_SPACING_X = 0.2
+GRID_SPACING_Y = 0.175
+
+_RX90 = [0.7071, 0.7071, 0, 0]
+_RX90_RY90 = [0.5, 0.5, 0.5, 0.5]   # RX90 + 90deg around Y
+
+# Per-object z keeps each object's bottom flush with the table surface
+_SCANNED_Z = {
+    "aspirin":        -0.3652,
+    "hot_sauce":      -0.3115,
+    "jello":          -0.3738,
+    "mustard":        -0.3138,
+    "tomato_sauce":   -0.3603,
+    "toothpaste_box": -0.3867,
+}
+
+def _scanned_placements(low: bool):
+    gx, gy = GRID_BASE_X, GRID_BASE_Y
+    sx, sy = GRID_SPACING_X, GRID_SPACING_Y
+    items = [
+        ("aspirin",        "aspirin_low.xml"        if low else "aspirin.xml",        "aspirin_",        0, 0, _RX90),
+        ("hot_sauce",      "hot_sauce_low.xml"      if low else "hot_sauce.xml",      "hot_sauce_",      0, 1, _RX90),
+        ("jello",          "jello_low.xml"          if low else "jello.xml",          "jello_",          0, 2, _RX90_RY90),
+        ("mustard",        "mustard_low.xml"        if low else "mustard.xml",        "mustard_",        1, 0, _RX90),
+        ("tomato_sauce",   "tomato_sauce_low.xml"   if low else "tomato_sauce.xml",   "scan_tomato_",    1, 1, _RX90),
+        ("toothpaste_box", "toothpaste_box_low.xml" if low else "toothpaste_box.xml", "toothpaste_box_", 1, 2, _RX90),
+    ]
+    return [
+        (_SCANNED / name / xml, prefix, [gx + row * sx, gy + col * sy, _SCANNED_Z[name]], quat)
+        for name, xml, prefix, row, col, quat in items
+    ]
+
 # Arm base positions: 12 inches (0.3048 m) left/right of center, at table surface (z = -0.43)
 # Y center shifted +0.15 m so both arms land on the visible workbench table surface.
-LEFT_ARM_POS = [0.0, 0.7048, -0.43]
-RIGHT_ARM_POS = [0.0, 0.0952, -0.43]
+LEFT_ARM_POS = [0.508, 0.4778, -0.43]
+RIGHT_ARM_POS = [0.508, -0.1318, -0.43]
 
 # Per-arm home configuration (from yam.xml keyframe)
 _HOME_QPOS = [0, 1.047, 1.047, 0, 0, 0, 0, 0]  # joint1..6, left_finger, right_finger
@@ -74,7 +132,7 @@ def _attach_object(scene_spec: mujoco.MjSpec, xml_path: Path, prefix: str, pos: 
     mount.attach_body(obj_spec.worldbody.first_body(), prefix, "")
 
 
-def build_model() -> mujoco.MjModel:
+def build_model(scanned_objects: bool = False, low_poly: bool = False) -> mujoco.MjModel:
     """Compose the scene by attaching two YAM arms and tabletop objects to the workbench world."""
     scene_spec = mujoco.MjSpec()
     scene_spec.from_file(str(SCENE_XML))
@@ -88,19 +146,31 @@ def build_model() -> mujoco.MjModel:
     right_spec.from_file(str(YAM_XML))
     _name_meshes(right_spec)
 
+    ox, oy, oz = SCENE_OFFSET
+
     # Attach left arm with "left_" prefix
     left_mount = scene_spec.worldbody.add_frame()
-    left_mount.pos = LEFT_ARM_POS
+    left_mount.pos = [LEFT_ARM_POS[0] + ox, LEFT_ARM_POS[1] + oy, LEFT_ARM_POS[2] + oz]
     left_mount.attach_body(left_spec.worldbody.first_body(), "left_", "")
 
     # Attach right arm with "right_" prefix
     right_mount = scene_spec.worldbody.add_frame()
-    right_mount.pos = RIGHT_ARM_POS
+    right_mount.pos = [RIGHT_ARM_POS[0] + ox, RIGHT_ARM_POS[1] + oy, RIGHT_ARM_POS[2] + oz]
     right_mount.attach_body(right_spec.worldbody.first_body(), "right_", "")
 
     # Add static tabletop objects
-    for xml_path, prefix, pos, quat in OBJECT_PLACEMENTS:
-        _attach_object(scene_spec, xml_path, prefix, pos, quat)
+    if scanned_objects:
+        placements = _scanned_placements(low=low_poly)
+    else:
+        placements = OBJECT_PLACEMENTS
+    px, py, pz = OBJECT_OFFSET
+    for xml_path, prefix, pos, quat in placements:
+        _attach_object(scene_spec, xml_path, prefix,
+                       [pos[0] + ox + px, pos[1] + oy + py, pos[2] + oz + pz], quat)
+
+    # Basket (SCENE_OFFSET applied, but not OBJECT_OFFSET)
+    _attach_object(scene_spec, BASKET_XML, "basket_",
+                   [BASKET_POS[0] + ox, BASKET_POS[1] + oy, BASKET_POS[2] + oz])
 
     return scene_spec.compile()
 
@@ -108,8 +178,8 @@ def build_model() -> mujoco.MjModel:
 class BimanualYamWorkbenchEnv:
     """Two YAM robot arms on a messy workbench."""
 
-    def __init__(self):
-        self.model = build_model()
+    def __init__(self, scanned_objects: bool = False, low_poly: bool = False):
+        self.model = build_model(scanned_objects=scanned_objects, low_poly=low_poly)
         self.data = mujoco.MjData(self.model)
 
         self.n_actuators = self.model.nu

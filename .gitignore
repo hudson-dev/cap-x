@@ -1,3 +1,7 @@
+# Scanned objects and media
+objects/
+media/
+
 # Large 3D assets (too large for GitHub)
 worlds/Messy Workbench/Messy Workbench Room_vertex_colored_mesh.glb
 worlds/Messy Workbench/Messy Workbench Room_texture_mesh.glb

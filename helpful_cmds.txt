@@ -2,3 +2,6 @@ conda activate mujuco
 cd /mnt/spare-ssd/hudsonssd/development/cap-x
 python simulation/run.py          # MuJoCo viewer
 python simulation/run.py --splat  # With Gaussian splat rendering
+python simulation/run.py --scanned-objects # w/ scanned objects
+python simulation/run.py --scanned-objects --static
+python simulation/run.py --scanned-objects --low-poly --static

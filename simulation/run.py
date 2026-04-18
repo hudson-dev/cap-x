@@ -28,10 +28,22 @@ def main():
     parser.add_argument(
         "--splat-height", type=int, default=480, help="Splat render height"
     )
+    parser.add_argument(
+        "--scanned-objects", action="store_true",
+        help="Replace default tabletop objects with the 6 scanned objects in a 2x3 grid",
+    )
+    parser.add_argument(
+        "--static", action="store_true",
+        help="Disable physics stepping — just view the scene (much faster for checking positions)",
+    )
+    parser.add_argument(
+        "--low-poly", action="store_true",
+        help="Use decimated 10k-face meshes for scanned objects (much faster rendering)",
+    )
     args = parser.parse_args()
 
     print("Building simulation environment ...")
-    env = BimanualYamWorkbenchEnv()
+    env = BimanualYamWorkbenchEnv(scanned_objects=args.scanned_objects, low_poly=args.low_poly)
     print(f"  Model: {env.model.nq} qpos, {env.model.nv} qvel, {env.model.nu} actuators")
 
     # Initialize splat renderer if requested
@@ -56,22 +68,28 @@ def main():
         env.reset()
         viewer.sync()
 
-        # Step multiple times per viewer frame to maintain real-time with fine timestep
-        n_steps = max(1, int(1.0 / 60.0 / env.model.opt.timestep))
+        if args.static:
+            # No physics — just render the scene for inspection
+            while viewer.is_running():
+                viewer.sync()
+                time.sleep(1.0 / 10.0)
+        else:
+            # Step multiple times per viewer frame to maintain real-time with fine timestep
+            n_steps = max(1, int(1.0 / 60.0 / env.model.opt.timestep))
 
-        while viewer.is_running():
-            step_start = time.time()
+            while viewer.is_running():
+                step_start = time.time()
 
-            for _ in range(n_steps):
-                env.step(env.data.ctrl)
+                for _ in range(n_steps):
+                    env.step(env.data.ctrl)
 
-            # Sync viewer
-            viewer.sync()
+                # Sync viewer
+                viewer.sync()
 
-            # Maintain real-time
-            dt = n_steps * env.model.opt.timestep - (time.time() - step_start)
-            if dt > 0:
-                time.sleep(dt)
+                # Maintain real-time
+                dt = n_steps * env.model.opt.timestep - (time.time() - step_start)
+                if dt > 0:
+                    time.sleep(dt)
 
 
 if __name__ == "__main__":
