@@ -91,9 +91,25 @@ def _scanned_placements(low: bool):
 LEFT_ARM_POS = [0.508, 0.4778, -0.43]
 RIGHT_ARM_POS = [0.508, -0.1318, -0.43]
 
-# Per-arm home configuration (from yam.xml keyframe)
-_HOME_QPOS = [0, 1.047, 1.047, 0, 0, 0, 0, 0]  # joint1..6, left_finger, right_finger
-_HOME_CTRL = [0, 1.047, 1.047, 0, 0, 0, 0]       # joint1..6, gripper
+# Symmetric home (fallback): joint1..6 + left_finger + right_finger
+_HOME_QPOS = [0, 1.047, 1.047, 0, 0, 0, 0, 0]
+_HOME_CTRL = [0, 1.047, 1.047, 0, 0, 0, 0]
+
+# Asymmetric bimanual init poses in the 14-D normalized convention
+# [j1..6, gripper] — joints in radians, gripper in [0, 1].
+# Ported from third_party/robots_realtime eyeball_env._eyeball_sim_config().
+_INIT_Q_LEFT = [
+    -0.20656902, 0.47283894, 0.99431604, -0.7043946,
+    -0.30842298, -0.32864118, 0.9987507,
+]
+_INIT_Q_RIGHT = [
+    0.20160982, 0.39005876, 1.1182956, -0.8726253,
+    0.13332571, 0.42629892, 0.9895317,
+]
+
+_ARM_PREFIXES = ["left", "right"]
+_ACTION_DIM = 14  # 7 per arm × 2 arms
+_DEFAULT_DECIMATION = 17  # 0.0005 s × 17 ≈ 8.5 ms per control step
 
 
 def _name_meshes(spec: mujoco.MjSpec):
@@ -176,13 +192,21 @@ def build_model(scanned_objects: bool = False, low_poly: bool = False) -> mujoco
 
 
 class BimanualYamWorkbenchEnv:
-    """Two YAM robot arms on a messy workbench."""
+    """Two YAM robot arms on a messy workbench.
+
+    Exposes the robots_realtime 14-D action convention:
+        [left_j1..6, left_gripper, right_j1..6, right_gripper]
+    Joint entries are radians, gripper entries are normalized to [0, 1] and
+    mapped to the model's finger joint range at runtime.
+    """
 
     def __init__(self, scanned_objects: bool = False, low_poly: bool = False):
         self.model = build_model(scanned_objects=scanned_objects, low_poly=low_poly)
         self.data = mujoco.MjData(self.model)
 
         self.n_actuators = self.model.nu
+        self.arm_prefixes = list(_ARM_PREFIXES)
+        self.action_dim = _ACTION_DIM
 
         # Cache end-effector body IDs
         self._left_ee_id = mujoco.mj_name2id(
@@ -192,38 +216,137 @@ class BimanualYamWorkbenchEnv:
             self.model, mujoco.mjtObj.mjOBJ_BODY, "right_link_6"
         )
 
+        self._build_index_maps()
+        self._detect_gripper_ctrl_max()
+
+        print(
+            f"[BimanualYamWorkbenchEnv] nu={self.model.nu}  "
+            f"gripper_ctrl_max={self._gripper_ctrl_max:.4f}  "
+            f"ctrl_indices={self._ctrl_indices}"
+        )
+
         self.reset()
 
-    def reset(self) -> dict:
-        """Reset simulation to home configuration."""
+    def _build_index_maps(self):
+        """Map 14-D state/action indices -> MuJoCo qpos/ctrl indices.
+
+        Index layout: for each arm prefix, 6 joints then the gripper slot.
+        Gripper slots are recorded in ``_gripper_set`` so step/reset/get_state
+        can scale them by the finger joint range.
+        """
+        self._qpos_indices: list[int] = []
+        self._ctrl_indices: list[int] = []
+        self._gripper_set: set[int] = set()
+
+        idx = 0
+        for prefix in self.arm_prefixes:
+            for j in range(1, 7):
+                jnt_name = f"{prefix}_joint{j}"
+                jnt_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jnt_name)
+                if jnt_id < 0:
+                    raise RuntimeError(f"joint not found: {jnt_name}")
+                self._qpos_indices.append(int(self.model.jnt_qposadr[jnt_id]))
+
+                act_name = f"{prefix}_joint{j}"
+                act_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_name)
+                if act_id < 0:
+                    raise RuntimeError(f"actuator not found: {act_name}")
+                self._ctrl_indices.append(int(act_id))
+                idx += 1
+
+            finger_jnt = f"{prefix}_left_finger"
+            finger_jnt_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, finger_jnt
+            )
+            if finger_jnt_id < 0:
+                raise RuntimeError(f"joint not found: {finger_jnt}")
+            self._qpos_indices.append(int(self.model.jnt_qposadr[finger_jnt_id]))
+
+            grip_act = f"{prefix}_gripper"
+            grip_act_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, grip_act
+            )
+            if grip_act_id < 0:
+                raise RuntimeError(f"actuator not found: {grip_act}")
+            self._ctrl_indices.append(int(grip_act_id))
+            self._gripper_set.add(idx)
+            idx += 1
+
+    def _detect_gripper_ctrl_max(self):
+        """Read the positive end of the finger joint range to scale [0,1] gripper input."""
+        self._gripper_ctrl_max = 0.0475  # fallback matching new yam.xml
+        for prefix in self.arm_prefixes:
+            finger_jnt_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_JOINT, f"{prefix}_left_finger"
+            )
+            if finger_jnt_id >= 0:
+                self._gripper_ctrl_max = float(self.model.jnt_range[finger_jnt_id, 1])
+                break
+
+    def _default_init_action(self) -> np.ndarray:
+        return np.array(_INIT_Q_LEFT + _INIT_Q_RIGHT, dtype=np.float64)
+
+    def reset(self, init_q: np.ndarray | None = None) -> dict:
+        """Reset simulation to home.
+
+        Args:
+            init_q: Optional 14-D normalized init state. Defaults to the
+                    asymmetric robots_realtime bimanual pose.
+        """
         mujoco.mj_resetData(self.model, self.data)
 
-        # Set home qpos for both arms
-        # qpos layout: [left_joint1..6, left_left_finger, left_right_finger,
-        #               right_joint1..6, right_left_finger, right_right_finger]
-        self.data.qpos[:8] = _HOME_QPOS
-        self.data.qpos[8:16] = _HOME_QPOS
+        q = self._default_init_action() if init_q is None else np.asarray(init_q, dtype=np.float64)
+        assert q.shape == (self.action_dim,), f"init_q must be {self.action_dim}-D, got {q.shape}"
 
-        # Set home ctrl for both arms
-        # ctrl layout: [left_joint1..6, left_gripper,
-        #               right_joint1..6, right_gripper]
-        self.data.ctrl[:7] = _HOME_CTRL
-        self.data.ctrl[7:14] = _HOME_CTRL
+        for i, qpos_idx in enumerate(self._qpos_indices):
+            val = float(q[i])
+            if i in self._gripper_set:
+                val = val * self._gripper_ctrl_max
+            self.data.qpos[qpos_idx] = val
+            self.data.ctrl[self._ctrl_indices[i]] = val
 
         mujoco.mj_forward(self.model, self.data)
         return self.get_observation()
 
-    def step(self, ctrl: np.ndarray) -> dict:
-        """Apply control and step the simulation.
+    def step(self, action_14d: np.ndarray, *, decimation: int = _DEFAULT_DECIMATION) -> dict:
+        """Apply a 14-D action and advance physics ``decimation`` steps.
 
         Args:
-            ctrl: Control vector of shape (n_actuators,).
-                  Left arm  [0:7]:  joint1-6 positions (rad) + gripper (0.0-0.041 m).
-                  Right arm [7:14]: joint1-6 positions (rad) + gripper (0.0-0.041 m).
+            action_14d: [left_j1..6, left_grip, right_j1..6, right_grip].
+                        Joints in rad, grippers in [0, 1].
+            decimation: Number of ``mj_step`` calls per control step.
         """
+        action = np.asarray(action_14d, dtype=np.float64)
+        assert action.shape == (self.action_dim,), \
+            f"action must be {self.action_dim}-D, got {action.shape}"
+
+        ctrl = np.zeros(self.model.nu)
+        for i in range(self.action_dim):
+            val = float(action[i])
+            if i in self._gripper_set:
+                val = val * self._gripper_ctrl_max
+            ctrl[self._ctrl_indices[i]] = val
+        self.data.ctrl[:] = ctrl
+
+        for _ in range(decimation):
+            mujoco.mj_step(self.model, self.data)
+        return self.get_observation()
+
+    def _set_ctrl_raw(self, ctrl: np.ndarray) -> dict:
+        """Legacy passthrough: copy ``ctrl`` to ``data.ctrl`` and step once."""
         np.copyto(self.data.ctrl, ctrl[: self.n_actuators])
         mujoco.mj_step(self.model, self.data)
         return self.get_observation()
+
+    def get_state_14d(self) -> np.ndarray:
+        """Read current pose into the 14-D normalized convention."""
+        state = np.zeros(self.action_dim, dtype=np.float64)
+        for i, qpos_idx in enumerate(self._qpos_indices):
+            val = float(self.data.qpos[qpos_idx])
+            if i in self._gripper_set:
+                val = float(np.clip(val / self._gripper_ctrl_max, 0.0, 1.0))
+            state[i] = val
+        return state
 
     def get_observation(self) -> dict:
         """Get current robot state."""

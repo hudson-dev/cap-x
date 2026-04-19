@@ -5,3 +5,4 @@ python simulation/run.py --splat  # With Gaussian splat rendering
 python simulation/run.py --scanned-objects # w/ scanned objects
 python simulation/run.py --scanned-objects --static
 python simulation/run.py --scanned-objects --low-poly --static
+python simulation/viser_demo.py --port 8080 --low-poly

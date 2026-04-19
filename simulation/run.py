@@ -40,7 +40,14 @@ def main():
         "--low-poly", action="store_true",
         help="Use decimated 10k-face meshes for scanned objects (much faster rendering)",
     )
+    parser.add_argument(
+        "--sine-demo", action="store_true",
+        help="Drive the arms with a scripted sine motion through the 14-D action API",
+    )
     args = parser.parse_args()
+
+    if args.sine_demo and args.static:
+        parser.error("--sine-demo and --static are mutually exclusive")
 
     print("Building simulation environment ...")
     env = BimanualYamWorkbenchEnv(scanned_objects=args.scanned_objects, low_poly=args.low_poly)
@@ -73,6 +80,37 @@ def main():
             while viewer.is_running():
                 viewer.sync()
                 time.sleep(1.0 / 10.0)
+        elif args.sine_demo:
+            # Drive the 14-D action API with a sine perturbation around home.
+            n_steps = max(1, int(1.0 / 60.0 / env.model.opt.timestep))
+            home = env.get_state_14d()
+
+            # Shoulder-ish joints: left_joint2, left_joint3, right_joint2, right_joint3
+            # in the 14-D layout [left_j1..6, left_grip, right_j1..6, right_grip].
+            sine_idx = np.array([1, 2, 8, 9])
+            amplitude = 0.3
+            freq_hz = 0.25
+
+            print(
+                f"[sine-demo] home = {np.round(home, 3).tolist()}"
+                f"\n[sine-demo] perturbing indices {sine_idx.tolist()} "
+                f"at {freq_hz} Hz, amplitude {amplitude} rad"
+            )
+
+            while viewer.is_running():
+                step_start = time.time()
+
+                action = home.copy()
+                t = env.data.time
+                action[sine_idx] += amplitude * np.sin(2.0 * np.pi * freq_hz * t)
+
+                env.step(action, decimation=n_steps)
+
+                viewer.sync()
+
+                dt = n_steps * env.model.opt.timestep - (time.time() - step_start)
+                if dt > 0:
+                    time.sleep(dt)
         else:
             # Step multiple times per viewer frame to maintain real-time with fine timestep
             n_steps = max(1, int(1.0 / 60.0 / env.model.opt.timestep))
@@ -81,7 +119,7 @@ def main():
                 step_start = time.time()
 
                 for _ in range(n_steps):
-                    env.step(env.data.ctrl)
+                    env._set_ctrl_raw(env.data.ctrl)
 
                 # Sync viewer
                 viewer.sync()
